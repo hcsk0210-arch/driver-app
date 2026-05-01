@@ -16,14 +16,7 @@ import json
 
 # Firebase 설정
 current_dir = os.path.dirname(os.path.abspath(__file__))
-
-# 로컬 실행: 같은 폴더의 firebase-key.json 사용
-# Render 배포: Secret File로 올린 /etc/secrets/firebase-key.json 사용
-key_path = os.environ.get("FIREBASE_KEY_PATH")
-if not key_path:
-    render_secret_path = "/etc/secrets/firebase-key.json"
-    local_key_path = os.path.join(current_dir, "firebase-key.json")
-    key_path = render_secret_path if os.path.exists(render_secret_path) else local_key_path
+key_path = os.path.join(current_dir, "firebase-key.json")
 
 if not firebase_admin._apps:
     cred = credentials.Certificate(key_path)
@@ -256,6 +249,12 @@ def main(page: ft.Page):
         update_date_text()
         page.update()
 
+    def on_message(msg):
+        if msg == "refresh":
+            render_ranking()
+
+    page.pubsub.subscribe(on_message)
+
     # ---------- 오늘 입력 현황 ----------
     def show_today_status(e):
         month = get_month()
@@ -354,6 +353,7 @@ def main(page: ft.Page):
 
         clear_input()
         render_ranking()
+        page.pubsub.send_all("refresh")
         show_msg("오늘 순수익이 기록되었습니다.")
 
     record_btn.on_click = update_profit
@@ -436,6 +436,7 @@ def main(page: ft.Page):
         admin_name_input.value = ""
         admin_value_input.value = ""
         render_ranking()
+        page.pubsub.send_all("refresh")
         show_msg("관리자 수정이 완료되었습니다.")
 
     delete_today_name_input = ft.TextField(label="오늘 기록 삭제할 닉네임")
@@ -484,6 +485,7 @@ def main(page: ft.Page):
 
         delete_today_name_input.value = ""
         render_ranking()
+        page.pubsub.send_all("refresh")
         show_msg("오늘 기록 삭제가 완료되었습니다.")
 
     def show_admin_logs(e):
@@ -1080,12 +1082,4 @@ def main(page: ft.Page):
     page.update()
 
 
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8550))
-    ft.app(
-        target=main,
-        host="0.0.0.0",
-        port=port,
-        view=ft.AppView.WEB_BROWSER,
-    )
-
+ft.app(target=main, port=8550, view=ft.AppView.WEB_BROWSER)
