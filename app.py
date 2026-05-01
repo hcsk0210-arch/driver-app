@@ -90,17 +90,25 @@ def main(page: ft.Page):
 
     def get_device_id():
         """
-        핸드폰/브라우저 1개를 구분하기 위한 고유번호.
-        첫 접속 때 만들고 이후 같은 기기에서는 계속 같은 값을 사용합니다.
+        브라우저/휴대폰마다 다른 고유번호를 저장합니다.
+        저장소 오류가 나도 unknown_device처럼 모두 같은 값으로 묶이지 않게 처리합니다.
         """
+        storage_key = "driver_profit_device_id"
+
         try:
-            device_id = page.client_storage.get("device_id")
-            if not device_id:
+            device_id = page.client_storage.get(storage_key)
+
+            if not device_id or device_id == "unknown_device":
                 device_id = str(uuid.uuid4())
-                page.client_storage.set("device_id", device_id)
+                page.client_storage.set(storage_key, device_id)
+
             return device_id
+
         except Exception:
-            return "unknown_device"
+        # 절대 unknown_device 같은 공통값을 쓰면 안 됨
+            if not hasattr(page, "_fallback_device_id"):
+                page._fallback_device_id = str(uuid.uuid4())
+            return page._fallback_device_id
 
     def get_device_locked_nickname():
         device_id = get_device_id()
