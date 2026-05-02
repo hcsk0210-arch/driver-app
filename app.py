@@ -1566,7 +1566,7 @@ def main(page: ft.Page):
                 on_long_press_end=admin_trophy_press_end,
                 on_tap=admin_trophy_click,
             ),
-            ft.Text("일일 순수익 순위", size=25, weight=ft.FontWeight.BOLD),
+            ft.Text("월간 순수익 순위", size=25, weight=ft.FontWeight.BOLD),
         ],
     )
     app_content = ft.Column(
