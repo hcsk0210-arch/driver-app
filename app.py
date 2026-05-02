@@ -695,6 +695,8 @@ def main(page: ft.Page):
                 lines.append(f"{t} | {admin} | 수정 | {item.get('target')} → {int(item.get('value', 0)):,}원")
             elif typ == "admin_rename":
                 lines.append(f"{t} | {admin} | 닉네임변경 | {item.get('old')} → {item.get('new')}")
+            elif typ == "admin_password_change":
+                lines.append(f"{t} | {admin} | 비밀번호변경 | {item.get('target')}")
             elif typ == "admin_delete_today":
                 lines.append(f"{t} | {admin} | 오늘기록삭제 | {item.get('target')} / {int(item.get('deleted_profit', 0)):,}원")
             elif typ == "admin_block_user":
@@ -1109,6 +1111,55 @@ def main(page: ft.Page):
         reject_signup_input.value = ""
         show_msg(f"{target} 가입 신청을 거절했습니다.")
 
+    change_pw_name_input = ft.TextField(label="비밀번호 바꿀 닉네임")
+    change_pw_new_input = ft.TextField(
+        label="새 비밀번호 숫자 4자리",
+        password=True,
+        can_reveal_password=True,
+        keyboard_type=ft.KeyboardType.NUMBER,
+    )
+
+    def admin_change_password(e):
+        if not admin_mode["enabled"]:
+            show_msg("관리자 모드를 먼저 여세요.")
+            return
+
+        target = safe_key(change_pw_name_input.value)
+        new_pw = (change_pw_new_input.value or "").strip()
+
+        if not target:
+            show_msg("비밀번호를 바꿀 닉네임을 입력하세요.")
+            return
+
+        if not new_pw.isdigit() or len(new_pw) != 4:
+            show_msg("새 비밀번호는 숫자 4자리로 입력하세요.")
+            return
+
+        user_ref = db.reference(f"users/{target}")
+        user_data = user_ref.get()
+
+        if user_data is None:
+            show_msg("존재하지 않는 닉네임입니다.")
+            return
+
+        user_ref.update({
+            "password": new_pw,
+            "password_changed_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "password_changed_by": get_my_name(),
+        })
+
+        db.reference("logs").push({
+            "type": "admin_password_change",
+            "target": target,
+            "admin": get_my_name(),
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        })
+
+        change_pw_name_input.value = ""
+        change_pw_new_input.value = ""
+        page.update()
+        show_msg(f"{target}님의 비밀번호를 변경했습니다.")
+
     admin_content = ft.Column(scroll=ft.ScrollMode.AUTO)
 
     def set_admin_menu(menu_name):
@@ -1158,6 +1209,15 @@ def main(page: ft.Page):
                 ft.ElevatedButton("차단 기기 목록 보기", on_click=admin_show_blocked),
             ])
 
+        elif menu_name == "비밀번호":
+            admin_content.controls.extend([
+                ft.Text("비밀번호 변경", weight=ft.FontWeight.BOLD),
+                ft.Text("가입된 사용자의 로그인 비밀번호를 숫자 4자리로 변경합니다.", size=12),
+                change_pw_name_input,
+                change_pw_new_input,
+                ft.ElevatedButton("비밀번호 변경", on_click=admin_change_password),
+            ])
+
         elif menu_name == "로그":
             admin_content.controls.extend([
                 ft.Text("관리자 로그 / 백업", weight=ft.FontWeight.BOLD),
@@ -1184,6 +1244,7 @@ def main(page: ft.Page):
             ft.ElevatedButton("기록", on_click=lambda e: set_admin_menu("기록")),
             ft.ElevatedButton("사용자", on_click=lambda e: set_admin_menu("사용자")),
             ft.ElevatedButton("가입승인", on_click=lambda e: set_admin_menu("가입승인")),
+            ft.ElevatedButton("비밀번호", on_click=lambda e: set_admin_menu("비밀번호")),
             ft.ElevatedButton("로그", on_click=lambda e: set_admin_menu("로그")),
             ft.ElevatedButton("닉네임", on_click=lambda e: set_admin_menu("닉네임")),
         ])
@@ -1566,7 +1627,7 @@ def main(page: ft.Page):
                 on_long_press_end=admin_trophy_press_end,
                 on_tap=admin_trophy_click,
             ),
-            ft.Text("월간 순수익 순위", size=25, weight=ft.FontWeight.BOLD),
+            ft.Text("일일 순수익 순위", size=25, weight=ft.FontWeight.BOLD),
         ],
     )
     app_content = ft.Column(
