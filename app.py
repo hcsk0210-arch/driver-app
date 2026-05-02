@@ -197,13 +197,102 @@ def main(page: ft.Page):
             b.disabled = False
 
         admin_section.visible = admin_mode["enabled"]
-        
+
+        # 로그인/승인 전에는 뒤 화면을 숨기고, 로그인 완료 후에만 메인 화면을 보여줍니다.
+        try:
+            app_content.visible = True
+            pending_screen.visible = False
+        except NameError:
+            pass
+
+        page.update()
+
+    # ---------- 강제 차단 / 강제 로그아웃 ----------
+    def is_current_user_blocked():
+        """현재 접속자가 관리자에게 가입 차단되었는지 확인합니다.
+        단, 관리자가 닉네임을 변경한 경우에는 차단이 아니라 새 닉네임으로 자동 전환합니다.
+        """
+        name = get_my_name()
+        if not name:
+            return False
+
+        try:
+            device_id = get_device_id()
+
+            # 1) 기기 차단 목록에 있으면 즉시 차단
+            if device_id and db.reference(f"blocked_devices/{device_id}").get() is not None:
+                return True
+
+            # 2) users에 현재 닉네임이 없으면 차단/삭제인지, 닉네임 변경인지 구분
+            if db.reference(f"users/{name}").get() is None:
+                device_data = db.reference(f"devices/{device_id}").get() if device_id else None
+                linked_name = None
+
+                if isinstance(device_data, dict):
+                    linked_name = device_data.get("nickname")
+                elif isinstance(device_data, str):
+                    linked_name = device_data
+
+                # A. devices/{현재기기}가 새 닉네임을 가리키면 닉네임 변경으로 처리
+                if linked_name and linked_name != name and db.reference(f"users/{linked_name}").get() is not None:
+                    page.pubsub.send_all(f"nickname_changed::{name}::{linked_name}")
+                    return False
+
+                # B. 혹시 devices 갱신이 늦었거나 누락돼도, users 전체에서 같은 device_id를 찾으면
+                #    차단이 아니라 닉네임 변경으로 처리
+                users_data = db.reference("users").get() or {}
+                if device_id and isinstance(users_data, dict):
+                    for candidate_name, candidate_data in users_data.items():
+                        if not isinstance(candidate_data, dict):
+                            continue
+                        if candidate_name != name and candidate_data.get("device_id") == device_id:
+                            page.pubsub.send_all(f"nickname_changed::{name}::{candidate_name}")
+                            return False
+
+                # C. 그래도 찾지 못할 때만 진짜 차단/삭제로 판단
+                return True
+
+        except Exception:
+            # 네트워크 오류 등 임시 오류는 차단으로 처리하지 않음
+            return False
+
+        return False
+
+    def force_logout_due_to_block(message="관리자에 의해 가입 차단되어 이용할 수 없습니다."):
+        """차단된 사용자를 현재 화면에서 즉시 내보냅니다."""
+        pending_login["checking"] = False
+        admin_mode["enabled"] = False
+        user_info["name"] = None
+
+        profit_input.disabled = True
+        record_btn.disabled = True
+        for b in quick_buttons.controls:
+            b.disabled = True
+
+        admin_section.visible = False
+        admin_unlock_row.visible = False
+
+        try:
+            page.client_storage.remove("saved_nickname")
+        except Exception:
+            pass
+
+        try:
+            login_dialog.open = False
+            pending_screen.visible = False
+            app_content.visible = False
+            blocked_screen.visible = True
+            blocked_text.value = f"🚫 {message}"
+        except NameError:
+            pass
+
         page.update()
 
     # ---------- 랭킹 ----------
     def render_ranking():
         nonlocal prev_ranks
 
+        archive_previous_month_if_needed()
         month = get_month()
         data = db.reference(f"rankings/{month}").get() or {}
         users = db.reference("users").get() or {}
@@ -260,6 +349,34 @@ def main(page: ft.Page):
     def on_message(msg):
         if msg == "refresh":
             render_ranking()
+        elif isinstance(msg, str) and msg.startswith("approved_login::"):
+            name = msg.split("::", 1)[1]
+            user_ref = db.reference(f"users/{name}")
+            if user_ref.get() is not None:
+                login_success(name, user_ref)
+        elif isinstance(msg, str) and msg.startswith("approval_rejected::"):
+            pending_login["checking"] = False
+            pending_hint_text.value = "가입 신청이 거절되었거나 삭제되었습니다. 관리자에게 문의하세요."
+            page.update()
+        elif isinstance(msg, str) and msg.startswith("force_logout::"):
+            target = msg.split("::", 1)[1]
+            if target == get_my_name():
+                force_logout_due_to_block()
+        elif isinstance(msg, str) and msg.startswith("nickname_changed::"):
+            parts = msg.split("::")
+            if len(parts) == 3:
+                old_name, new_name = parts[1], parts[2]
+                if old_name == get_my_name():
+                    user_info["name"] = new_name
+                    set_saved_nickname(new_name)
+                    try:
+                        blocked_screen.visible = False
+                        pending_screen.visible = False
+                        app_content.visible = True
+                    except NameError:
+                        pass
+                    render_ranking()
+                    show_msg(f"닉네임이 {new_name}(으)로 변경되었습니다.")
 
     page.pubsub.subscribe(on_message)
 
@@ -311,11 +428,71 @@ def main(page: ft.Page):
 
         show_msg("\n".join(lines))
 
+
+    # ---------- 지난달 기록 보관 / 보기 ----------
+    def get_previous_month():
+        now = datetime.now()
+        year = now.year
+        month = now.month - 1
+        if month == 0:
+            year -= 1
+            month = 12
+        return f"{year:04d}-{month:02d}"
+
+    def archive_previous_month_if_needed():
+        """지난달 rankings 데이터를 monthly_archives에 따로 보관합니다."""
+        prev_month = get_previous_month()
+        archive_ref = db.reference(f"monthly_archives/{prev_month}")
+
+        # 이미 보관되어 있으면 다시 덮어쓰지 않음
+        if archive_ref.get() is not None:
+            return
+
+        rankings = db.reference(f"rankings/{prev_month}").get() or {}
+        if not rankings:
+            return
+
+        archive_ref.set({
+            "archived_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "rankings": rankings,
+        })
+
+    def show_previous_month_total(e):
+        archive_previous_month_if_needed()
+        prev_month = get_previous_month()
+
+        archive_data = db.reference(f"monthly_archives/{prev_month}").get() or {}
+        rankings = archive_data.get("rankings") if isinstance(archive_data, dict) else {}
+
+        # archive가 아직 없으면 기존 rankings에서도 한 번 더 확인
+        if not rankings:
+            rankings = db.reference(f"rankings/{prev_month}").get() or {}
+
+        if not rankings:
+            show_msg("지난달 기록이 없습니다.")
+            return
+
+        sorted_totals = sorted(
+            rankings.items(),
+            key=lambda x: int(x[1] or 0),
+            reverse=True
+        )
+
+        lines = [f"📦 지난달 기록 ({prev_month})", ""]
+        for i, (name, total) in enumerate(sorted_totals, start=1):
+            lines.append(f"{i}위 - {name}  {int(total or 0):,}원")
+
+        show_msg("\n".join(lines))
+
     # ---------- 수익 입력 ----------
     def update_profit(e):
         name = get_my_name()
         if not name:
             show_msg("먼저 로그인하세요.")
+            return
+
+        if is_current_user_blocked():
+            force_logout_due_to_block()
             return
 
         today = get_today()
@@ -530,6 +707,12 @@ def main(page: ft.Page):
                 lines.append(f"{t} | {admin} | 기기차단해제 | {item.get('target')} / {item.get('device_count', 0)}개")
             elif typ == "admin_reset_device":
                 lines.append(f"{t} | {admin} | 기기초기화 | {item.get('target')} / {item.get('reset_count', 0)}개")
+            elif typ == "signup_request":
+                lines.append(f"{t} | 가입신청 | {item.get('target')} / {item.get('phone', '')}")
+            elif typ == "signup_approved":
+                lines.append(f"{t} | {admin} | 가입승인 | {item.get('target')} / {item.get('phone', '')}")
+            elif typ == "signup_rejected":
+                lines.append(f"{t} | {admin} | 가입거절 | {item.get('target')}")
             elif typ == "admin_backup_firebase":
                 lines.append(f"{t} | {admin} | 백업저장 | {item.get('file')}")
             else:
@@ -582,6 +765,11 @@ def main(page: ft.Page):
         # 닉네임 자체는 차단하지 않음.
         # 단, 기존 계정은 삭제해서 다른 정상 기기에서 같은 닉네임 재가입이 가능하게 함.
         db.reference(f"users/{target}").delete()
+
+        # 차단한 사람은 현재 월 랭킹/오늘 입력 현황에서도 바로 제거
+        current_month = get_month()
+        db.reference(f"rankings/{current_month}/{target}").delete()
+        db.reference(f"daily/{current_month}/{target}").delete()
 
         db.reference("logs").push({
             "type": "admin_block_device",
@@ -749,11 +937,24 @@ def main(page: ft.Page):
             return
 
         # users 이동
+        # 닉네임 필드도 새 닉네임으로 같이 바꿔둬야 접속 중인 사용자가 차단으로 오해되지 않습니다.
+        if isinstance(old_user, dict):
+            old_user["nickname"] = new
         db.reference(f"users/{new}").set(old_user)
         old_user_ref.delete()
 
         # devices 닉네임도 함께 변경
         devices = db.reference("devices").get() or {}
+        old_user_device_id = old_user.get("device_id") if isinstance(old_user, dict) else None
+
+        # users에 저장된 device_id가 있으면 그 기기는 무조건 새 닉네임으로 연결
+        if old_user_device_id:
+            db.reference(f"devices/{old_user_device_id}").set({
+                "nickname": new,
+                "locked_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            })
+
+        # devices 목록에서도 기존 닉네임으로 연결된 기기를 모두 새 닉네임으로 변경
         for device_id, device_data in devices.items():
             nickname = device_data.get("nickname") if isinstance(device_data, dict) else device_data
             if nickname == old:
@@ -784,10 +985,129 @@ def main(page: ft.Page):
             "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         })
 
+        # 접속 중인 사용자 화면에도 새 닉네임을 즉시 반영
+        page.pubsub.send_all(f"nickname_changed::{old}::{new}")
+
         rename_old_input.value = ""
         rename_new_input.value = ""
         render_ranking()
         show_msg("닉네임 변경이 완료되었습니다.")
+
+    approve_signup_input = ft.TextField(label="승인할 닉네임")
+    reject_signup_input = ft.TextField(label="거절할 닉네임")
+
+    def show_pending_signups(e):
+        if not admin_mode["enabled"]:
+            show_msg("관리자 모드를 먼저 여세요.")
+            return
+
+        pending = db.reference("pending_users").get() or {}
+        if not pending:
+            show_msg("가입 승인 대기자가 없습니다.")
+            return
+
+        lines = ["가입 승인 대기 목록", ""]
+        for name, data in pending.items():
+            if not isinstance(data, dict):
+                continue
+            phone = data.get("phone", "")
+            requested_at = data.get("requested_at", "")
+            lines.append(f"- {name} / {phone} / {requested_at}")
+
+        show_msg("\n".join(lines))
+
+    def approve_signup(e):
+        if not admin_mode["enabled"]:
+            show_msg("관리자 모드를 먼저 여세요.")
+            return
+
+        target = safe_key(approve_signup_input.value)
+        if not target:
+            show_msg("승인할 닉네임을 입력하세요.")
+            return
+
+        pending_ref = db.reference(f"pending_users/{target}")
+        pending = pending_ref.get()
+
+        if pending is None or not isinstance(pending, dict):
+            show_msg("해당 닉네임의 가입 신청이 없습니다.")
+            return
+
+        if db.reference(f"users/{target}").get() is not None:
+            show_msg("이미 가입된 닉네임입니다.")
+            pending_ref.delete()
+            return
+
+        device_id = pending.get("device_id")
+        phone = pending.get("phone", "")
+        pw = pending.get("password", "")
+
+        if device_id and db.reference(f"blocked_devices/{device_id}").get() is not None:
+            show_msg("차단된 기기의 가입 신청입니다. 승인할 수 없습니다.")
+            return
+
+        db.reference(f"users/{target}").set({
+            "password": pw,
+            "phone": phone,
+            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "approved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "approved_by": get_my_name(),
+            "device_locked": True,
+            "device_id": device_id,
+            "status": "approved",
+        })
+
+        if device_id:
+            db.reference(f"devices/{device_id}").set({
+                "nickname": target,
+                "locked_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            })
+
+        month = get_month()
+        db.reference(f"rankings/{month}/{target}").set(0)
+        db.reference(f"users/{target}/monthly_total/{month}").set(0)
+
+        pending_ref.delete()
+
+        db.reference("logs").push({
+            "type": "signup_approved",
+            "target": target,
+            "phone": phone,
+            "admin": get_my_name(),
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        })
+
+        approve_signup_input.value = ""
+        render_ranking()
+        page.pubsub.send_all("refresh")
+        show_msg(f"{target} 가입을 승인했습니다. 해당 사용자는 자동으로 입장됩니다.")
+
+    def reject_signup(e):
+        if not admin_mode["enabled"]:
+            show_msg("관리자 모드를 먼저 여세요.")
+            return
+
+        target = safe_key(reject_signup_input.value)
+        if not target:
+            show_msg("거절할 닉네임을 입력하세요.")
+            return
+
+        pending_ref = db.reference(f"pending_users/{target}")
+        pending = pending_ref.get()
+        if pending is None:
+            show_msg("해당 닉네임의 가입 신청이 없습니다.")
+            return
+
+        pending_ref.delete()
+        db.reference("logs").push({
+            "type": "signup_rejected",
+            "target": target,
+            "admin": get_my_name(),
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        })
+
+        reject_signup_input.value = ""
+        show_msg(f"{target} 가입 신청을 거절했습니다.")
 
     admin_content = ft.Column(scroll=ft.ScrollMode.AUTO)
 
@@ -807,6 +1127,18 @@ def main(page: ft.Page):
                 ft.Text("오늘 기록 삭제", weight=ft.FontWeight.BOLD),
                 delete_today_name_input,
                 ft.ElevatedButton("오늘 기록 삭제", on_click=admin_delete_today),
+            ])
+
+        elif menu_name == "가입승인":
+            admin_content.controls.extend([
+                ft.Text("가입 승인 대기", weight=ft.FontWeight.BOLD),
+                ft.ElevatedButton("가입 신청 목록 보기", on_click=show_pending_signups),
+                ft.Divider(),
+                approve_signup_input,
+                ft.ElevatedButton("가입 승인", on_click=approve_signup),
+                ft.Divider(),
+                reject_signup_input,
+                ft.ElevatedButton("가입 거절", on_click=reject_signup),
             ])
 
         elif menu_name == "사용자":
@@ -851,6 +1183,7 @@ def main(page: ft.Page):
             ft.ElevatedButton("금액", on_click=lambda e: set_admin_menu("금액")),
             ft.ElevatedButton("기록", on_click=lambda e: set_admin_menu("기록")),
             ft.ElevatedButton("사용자", on_click=lambda e: set_admin_menu("사용자")),
+            ft.ElevatedButton("가입승인", on_click=lambda e: set_admin_menu("가입승인")),
             ft.ElevatedButton("로그", on_click=lambda e: set_admin_menu("로그")),
             ft.ElevatedButton("닉네임", on_click=lambda e: set_admin_menu("닉네임")),
         ])
@@ -871,8 +1204,18 @@ def main(page: ft.Page):
 
     # ---------- 로그인 / 회원가입 팝업 ----------
     nickname_input = ft.TextField(label="닉네임", autofocus=True)
-    password_input = ft.TextField(label="비밀번호", password=True, can_reveal_password=True)
-    login_message = ft.Text("처음 이용자는 닉네임/비밀번호 입력 후 회원가입을 누르세요.", size=12)
+    phone_input = ft.TextField(label="휴대폰번호", keyboard_type=ft.KeyboardType.PHONE)
+    password_input = ft.TextField(label="비밀번호 숫자 4자리", password=True, can_reveal_password=True, keyboard_type=ft.KeyboardType.NUMBER)
+    login_message = ft.Text("회원가입은 닉네임/휴대폰번호/숫자4자리 비밀번호 입력 후 신청하세요. 관리자가 승인해야 이용 가능합니다.", size=12)
+
+    pending_login = {"name": None, "password": None, "checking": False, "token": 0}
+    pending_status_text = ft.Text(
+        "⏳ 가입 승인 대기중입니다\n관리자 승인 후 이용 가능합니다.",
+        size=16,
+        weight=ft.FontWeight.BOLD,
+    )
+    pending_hint_text = ft.Text("승인되면 자동으로 입장합니다. 잠시만 기다려주세요.", size=12)
+    blocked_text = ft.Text("🚫 관리자에 의해 가입 차단되어 이용할 수 없습니다.", size=16, weight=ft.FontWeight.BOLD)
 
     login_dialog = ft.AlertDialog(
         modal=True,
@@ -881,6 +1224,7 @@ def main(page: ft.Page):
             controls=[
                 nickname_input,
                 password_input,
+                phone_input,
                 login_message,
             ],
             tight=True,
@@ -903,6 +1247,131 @@ def main(page: ft.Page):
     def close_login_dialog():
         login_dialog.open = False
         page.update()
+
+    def login_success(name, user_ref):
+        """승인 완료 후 자동 로그인 처리"""
+        pending_login["checking"] = False
+        set_device_locked_nickname(name)
+        user_info["name"] = name
+        user_ref.update({
+            "status": "approved",
+            "last_login": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "device_id": get_device_id(),
+        })
+
+        login_dialog.open = False
+        pending_screen.visible = False
+        try:
+            blocked_screen.visible = False
+        except NameError:
+            pass
+        app_content.visible = True
+        set_logged_in_ui()
+        render_ranking()
+        page.update()
+        show_msg(f"{name}님 로그인 완료")
+
+    def start_auto_approval_checker():
+        name = pending_login.get("name")
+        pw = pending_login.get("password")
+        if not name or not pw:
+            return
+
+        pending_login["token"] += 1
+        token = pending_login["token"]
+        pending_login["checking"] = True
+
+        def approval_worker():
+            while pending_login.get("checking") and pending_login.get("token") == token:
+                time.sleep(3)
+                try:
+                    current_name = pending_login.get("name")
+                    current_pw = pending_login.get("password")
+                    if not current_name or not current_pw:
+                        continue
+
+                    user_data = db.reference(f"users/{current_name}").get()
+                    if isinstance(user_data, dict) and user_data.get("status") == "approved":
+                        if user_data.get("password") == current_pw:
+                            pending_login["checking"] = False
+                            page.pubsub.send_all(f"approved_login::{current_name}")
+                            break
+                        pending_login["checking"] = False
+                        pending_hint_text.value = "비밀번호 정보가 맞지 않습니다. 로그인 화면에서 다시 로그인해주세요."
+                        login_dialog.open = True
+                        pending_screen.visible = False
+                        page.update()
+                        break
+
+                    pending = db.reference(f"pending_users/{current_name}").get()
+                    if pending is None:
+                        pending_login["checking"] = False
+                        page.pubsub.send_all(f"approval_rejected::{current_name}")
+                        break
+                except Exception:
+                    pass
+
+        threading.Thread(target=approval_worker, daemon=True).start()
+
+    def show_pending_wait_screen(name, pw):
+        pending_login["name"] = name
+        pending_login["password"] = pw
+        login_dialog.open = False
+        app_content.visible = False
+        try:
+            blocked_screen.visible = False
+        except NameError:
+            pass
+        pending_screen.visible = True
+        pending_status_text.value = f"⏳ {name}님 가입 승인 대기중입니다\n관리자 승인 후 자동으로 입장합니다."
+        pending_hint_text.value = "승인되면 자동으로 입장합니다. 잠시만 기다려주세요."
+        page.update()
+        start_auto_approval_checker()
+
+    def check_approval_status(e=None):
+        name = pending_login.get("name")
+        pw = pending_login.get("password")
+
+        if not name or not pw:
+            pending_hint_text.value = "가입 신청 정보가 없습니다. 다시 회원가입 신청을 해주세요."
+            login_dialog.open = True
+            pending_screen.visible = False
+            page.update()
+            return
+
+        user_ref = db.reference(f"users/{name}")
+        data = user_ref.get()
+
+        if isinstance(data, dict) and data.get("status") == "approved":
+            if data.get("password") != pw:
+                pending_hint_text.value = "비밀번호 정보가 맞지 않습니다. 로그인 화면에서 다시 로그인해주세요."
+                login_dialog.open = True
+                pending_screen.visible = False
+                page.update()
+                return
+            login_success(name, user_ref)
+            return
+
+        pending = db.reference(f"pending_users/{name}").get()
+        if pending is None:
+            pending_hint_text.value = "가입 신청이 거절되었거나 삭제되었습니다. 관리자에게 문의하세요."
+            page.update()
+            return
+
+        pending_hint_text.value = "아직 승인 대기중입니다. 관리자 승인 후 다시 확인해주세요."
+        page.update()
+
+    def back_to_login_from_pending(e=None):
+        pending_login["checking"] = False
+        pending_screen.visible = False
+        login_dialog.open = True
+        page.update()
+
+    def normalize_phone(text):
+        return "".join(ch for ch in (text or "") if ch.isdigit())
+
+    def is_valid_4digit_password(pw):
+        return len(pw) == 4 and pw.isdigit()
 
     def do_login(e):
         name = safe_key(nickname_input.value)
@@ -935,7 +1404,20 @@ def main(page: ft.Page):
         data = user_ref.get()
 
         if data is None:
-            login_message.value = "가입된 닉네임이 아닙니다. 회원가입을 먼저 눌러주세요."
+            pending = db.reference(f"pending_users/{name}").get()
+            if isinstance(pending, dict):
+                if pending.get("password") == pw:
+                    show_pending_wait_screen(name, pw)
+                else:
+                    login_message.value = "비밀번호가 틀렸습니다."
+                    page.update()
+            else:
+                login_message.value = "가입된 닉네임이 아닙니다. 회원가입 신청을 먼저 해주세요."
+                page.update()
+            return
+
+        if data.get("status") and data.get("status") != "approved":
+            login_message.value = "가입 승인 대기중입니다. 관리자에게 문의하세요."
             page.update()
             return
 
@@ -958,10 +1440,21 @@ def main(page: ft.Page):
 
     def do_register(e):
         name = safe_key(nickname_input.value)
+        phone = normalize_phone(phone_input.value)
         pw = password_input.value.strip()
 
-        if not name or not pw:
-            login_message.value = "닉네임과 비밀번호를 모두 입력하세요."
+        if not name or not phone or not pw:
+            login_message.value = "닉네임, 휴대폰번호, 비밀번호를 모두 입력하세요."
+            page.update()
+            return
+
+        if len(phone) < 10 or len(phone) > 11:
+            login_message.value = "휴대폰번호를 정확히 입력하세요. 예: 01012345678"
+            page.update()
+            return
+
+        if not is_valid_4digit_password(pw):
+            login_message.value = "비밀번호는 숫자 4자리만 가능합니다."
             page.update()
             return
 
@@ -983,38 +1476,56 @@ def main(page: ft.Page):
             page.update()
             return
 
-        user_ref = db.reference(f"users/{name}")
-        data = user_ref.get()
-
-        if data is not None:
+        if db.reference(f"users/{name}").get() is not None:
             login_message.value = "이미 존재하는 닉네임입니다. 다른 닉네임을 사용하세요."
             page.update()
             return
 
-        user_ref.set({
+        if db.reference(f"pending_users/{name}").get() is not None:
+            login_message.value = "이미 가입 신청이 접수되었습니다. 관리자 승인을 기다려주세요."
+            page.update()
+            return
+
+        db.reference(f"pending_users/{name}").set({
+            "nickname": name,
+            "phone": phone,
             "password": pw,
-            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "device_locked": True,
-            "device_id": get_device_id(),
+            "device_id": device_id,
+            "requested_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "status": "pending",
         })
 
-        # 회원가입 즉시 이번 달 랭킹에 0원으로 등록
-        month = get_month()
-        db.reference(f"rankings/{month}/{name}").set(0)
-        db.reference(f"users/{name}/monthly_total/{month}").set(0)
+        db.reference("logs").push({
+            "type": "signup_request",
+            "target": name,
+            "phone": phone,
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        })
 
-        set_device_locked_nickname(name)
-        user_info["name"] = name
-
-        close_login_dialog()
-        set_logged_in_ui()
-        render_ranking()
-        show_msg(f"{name}님 회원가입 완료. 바로 로그인되었습니다.")
+        login_message.value = "가입 신청 완료. 관리자 승인을 기다려주세요."
+        show_pending_wait_screen(name, pw)
+        show_msg("가입 신청이 접수되었습니다. 관리자 승인 후 이용 가능합니다.")
 
     login_dialog.actions = [
         ft.TextButton("로그인", on_click=do_login),
         ft.ElevatedButton("회원가입", on_click=do_register),
     ]
+
+    def start_block_monitor():
+        """접속 중인 사용자가 차단되면 몇 초 안에 자동으로 화면에서 내보냅니다."""
+        def block_worker():
+            while True:
+                time.sleep(3)
+                try:
+                    name = get_my_name()
+                    if name and is_current_user_blocked():
+                        page.pubsub.send_all(f"force_logout::{name}")
+                except Exception:
+                    pass
+
+        threading.Thread(target=block_worker, daemon=True).start()
+
+    start_block_monitor()
 
     # ---------- 새로고침 ----------
     def manual_refresh(e=None):
@@ -1058,24 +1569,53 @@ def main(page: ft.Page):
             ft.Text("일일 순수익 순위", size=25, weight=ft.FontWeight.BOLD),
         ],
     )
-    page.add(
-        title,
-        date_text,
-        info_text,
-        
+    app_content = ft.Column(
+        visible=False,
+        controls=[
+            title,
+            date_text,
+            info_text,
+            ft.ElevatedButton("지난달 기록 보기", on_click=show_previous_month_total),
+            ft.ElevatedButton("새로고침", on_click=manual_refresh),
+            status_text,
+            ft.ElevatedButton("오늘 입력 현황 보기", on_click=show_today_status),
+            rank_list,
+            profit_input,
+            quick_buttons,
+            record_btn,
+            ft.Divider(),
+            admin_unlock_row,
+            admin_section,
+        ],
+    )
 
-        ft.ElevatedButton("이번 달 전투원들 총액 보기", on_click=show_month_total),
-        ft.ElevatedButton("새로고침", on_click=manual_refresh),
-        status_text,
+    pending_screen = ft.Column(
+        visible=False,
+        horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+        controls=[
+            ft.Container(height=80),
+            pending_status_text,
+            pending_hint_text,
+            ft.Row(
+                alignment=ft.MainAxisAlignment.CENTER,
+                controls=[
+                    ft.TextButton("로그인 화면", on_click=back_to_login_from_pending),
+                ],
+            ),
+        ],
+    )
 
-        ft.ElevatedButton("오늘 입력 현황 보기", on_click=show_today_status),
-        rank_list,
-        profit_input,
-        quick_buttons,
-        record_btn,
-        ft.Divider(),
-        admin_unlock_row,
-        admin_section)
+    blocked_screen = ft.Column(
+        visible=False,
+        horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+        controls=[
+            ft.Container(height=120),
+            blocked_text,
+            ft.Text("관리자에게 문의하세요.", size=12),
+        ],
+    )
+
+    page.add(app_content, pending_screen, blocked_screen)
 
     # 처음 접속 시 항상 로그인 팝업 표시
     saved_name = get_device_locked_nickname() or get_saved_nickname()
