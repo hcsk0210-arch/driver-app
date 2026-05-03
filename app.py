@@ -141,21 +141,34 @@ def main(page: ft.Page):
     date_text = ft.Text("", size=14)
     info_text = ft.Text("※ 수익 입력 기준: 익일 오전 7시까지", size=12)
     rank_list = ft.ListView(expand=True, spacing=8, auto_scroll=False)
+
+    button_style = ft.ButtonStyle(
+        shape=ft.RoundedRectangleBorder(radius=10),
+    )
+
+    def styled_button(text, on_click=None, disabled=False, height=48):
+        return ft.ElevatedButton(
+            text,
+            on_click=on_click,
+            disabled=disabled,
+            height=height,
+            style=button_style,
+        )
     
     profit_input = ft.TextField(
         label="오늘 순수익 입력",
         keyboard_type=ft.KeyboardType.NUMBER,
         disabled=True)
 
-    record_btn = ft.ElevatedButton("기록하기", disabled=True)
+    record_btn = styled_button("기록하기", disabled=True, height=52)
 
     quick_buttons = ft.Row(
         wrap=True,
         controls=[
-            ft.ElevatedButton("초기화", disabled=True),
-            ft.ElevatedButton("+1만", disabled=True),
-            ft.ElevatedButton("+5만", disabled=True),
-            ft.ElevatedButton("+10만", disabled=True),
+            styled_button("초기화", disabled=True, height=45),
+            styled_button("+1만", disabled=True, height=45),
+            styled_button("+5만", disabled=True, height=45),
+            styled_button("+10만", disabled=True, height=45),
         ])
 
     admin_section = ft.Column(visible=False, scroll=ft.ScrollMode.AUTO, height=560)
@@ -325,13 +338,31 @@ def main(page: ft.Page):
 
                 medal = "🥇" if i == 0 else "🥈" if i == 1 else "🥉" if i == 2 else ""
 
-                rank_list.controls.append(
-                    ft.ListTile(
-                        title=ft.Text(
-                            f"{medal} {rank}위 {change} - {name}",
-                            weight=ft.FontWeight.BOLD if name == get_my_name() else None),
-                        subtitle=ft.Text(f"{int(profit):,}원"))
+                is_me = name == get_my_name()
+                is_first = i == 0
+                row_bgcolor = "#1e3a8a" if is_first else "#334155" if is_me else None
+                title_color = "#facc15" if is_me else None
+
+                rank_tile = ft.ListTile(
+                    title=ft.Text(
+                        f"{medal} {rank}위 {change} - {name}",
+                        weight=ft.FontWeight.BOLD if (is_me or is_first) else None,
+                        color=title_color,
+                    ),
+                    subtitle=ft.Text(f"{int(profit):,}원"),
                 )
+
+                if row_bgcolor:
+                    rank_list.controls.append(
+                        ft.Container(
+                            content=rank_tile,
+                            bgcolor=row_bgcolor,
+                            border_radius=10,
+                            padding=2,
+                        )
+                    )
+                else:
+                    rank_list.controls.append(rank_tile)
         else:
             rank_list.controls.append(ft.Text("아직 이번 달 기록이 없습니다."))
 
@@ -583,6 +614,7 @@ def main(page: ft.Page):
     # ---------- 관리자 ----------
     admin_name_input = ft.TextField(label="수정할 닉네임")
     admin_value_input = ft.TextField(label="수정 금액")
+    admin_add_value_input = ft.TextField(label="추가할 금액")
 
     def admin_update(e):
         if not admin_mode["enabled"]:
@@ -623,6 +655,75 @@ def main(page: ft.Page):
         render_ranking()
         page.pubsub.send_all("refresh")
         show_msg("관리자 수정이 완료되었습니다.")
+
+    def admin_add_profit(e):
+        if not admin_mode["enabled"]:
+            show_msg("관리자 모드를 먼저 여세요.")
+            return
+
+        target = safe_key(admin_name_input.value)
+        raw = admin_add_value_input.value.replace(",", "").strip()
+
+        if not target:
+            show_msg("추가할 닉네임을 입력하세요.")
+            return
+
+        if not raw.isdigit():
+            show_msg("추가 금액을 숫자로 입력하세요.")
+            return
+
+        if db.reference(f"users/{target}").get() is None:
+            show_msg("존재하지 않는 닉네임입니다.")
+            return
+
+        add_value = int(raw)
+
+        if add_value <= 0:
+            show_msg("추가 금액은 1원 이상 입력하세요.")
+            return
+
+        month = get_month()
+        today = get_today()
+
+        ranking_ref = db.reference(f"rankings/{month}/{target}")
+        current_total = int(ranking_ref.get() or 0)
+        new_total = current_total + add_value
+
+        ranking_ref.set(new_total)
+        db.reference(f"users/{target}/monthly_total/{month}").set(new_total)
+
+        # 오늘 기록이 이미 있으면 오늘 기록에도 추가해서
+        # '오늘 기록 삭제' 시 차감 금액이 맞도록 맞춰줍니다.
+        daily_ref = db.reference(f"daily/{month}/{target}/{today}")
+        daily_data = daily_ref.get()
+        if daily_data is not None:
+            if isinstance(daily_data, dict):
+                current_daily = int(daily_data.get("profit", 0) or 0)
+                daily_data["profit"] = current_daily + add_value
+                daily_data["admin_added"] = int(daily_data.get("admin_added", 0) or 0) + add_value
+                daily_data["admin_added_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                daily_ref.set(daily_data)
+            else:
+                daily_ref.set({
+                    "profit": int(daily_data or 0) + add_value,
+                    "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "admin_added": add_value,
+                })
+
+        db.reference("logs").push({
+            "type": "admin_score_add",
+            "target": target,
+            "add_value": add_value,
+            "before": current_total,
+            "after": new_total,
+            "admin": get_my_name(),
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        })
+
+        admin_add_value_input.value = ""
+        render_ranking()
+        page.pubsub.send_all("refresh")
+        show_msg(f"{target}님 금액에 {add_value:,}원이 추가되었습니다.\n현재 총액: {new_total:,}원")
 
     delete_today_name_input = ft.TextField(label="오늘 기록 삭제할 닉네임")
 
@@ -1167,10 +1268,16 @@ def main(page: ft.Page):
 
         if menu_name == "금액":
             admin_content.controls.extend([
-                ft.Text("수정", weight=ft.FontWeight.BOLD),
+                ft.Text("금액 수정 / 추가", weight=ft.FontWeight.BOLD),
                 admin_name_input,
-                admin_value_input,
-                ft.ElevatedButton("수정", on_click=admin_update),
+                ft.Row(
+                    wrap=True,
+                    controls=[
+                        ft.Column([admin_value_input, ft.ElevatedButton("총액 수정", on_click=admin_update)], width=180),
+                        ft.Column([admin_add_value_input, ft.ElevatedButton("금액 추가", on_click=admin_add_profit)], width=180),
+                    ],
+                ),
+                ft.Text("※ 총액 수정은 이번 달 총액을 해당 금액으로 바꿉니다. 금액 추가는 현재 총액에 더합니다.", size=12),
             ])
 
         elif menu_name == "기록":
@@ -1627,7 +1734,7 @@ def main(page: ft.Page):
                 on_long_press_end=admin_trophy_press_end,
                 on_tap=admin_trophy_click,
             ),
-            ft.Text("일일 순수익 순위", size=25, weight=ft.FontWeight.BOLD),
+            ft.Text("월간 순수익 순위", size=25, weight=ft.FontWeight.BOLD),
         ],
     )
     app_content = ft.Column(
@@ -1636,10 +1743,10 @@ def main(page: ft.Page):
             title,
             date_text,
             info_text,
-            ft.ElevatedButton("지난달 기록 보기", on_click=show_previous_month_total),
-            ft.ElevatedButton("새로고침", on_click=manual_refresh),
+            styled_button("지난달 기록 보기", on_click=show_previous_month_total),
+            styled_button("새로고침", on_click=manual_refresh),
             status_text,
-            ft.ElevatedButton("오늘 입력 현황 보기", on_click=show_today_status),
+            styled_button("오늘 입력 현황 보기", on_click=show_today_status),
             rank_list,
             profit_input,
             quick_buttons,
